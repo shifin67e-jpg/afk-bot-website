@@ -1,63 +1,90 @@
 # syntax=docker/dockerfile:1.4
-FROM node:18-alpine
+FROM node:20-alpine AS builder
 
-# Set timezone, update packages, install sqlite system deps
-RUN apk add --no-cache tzdata sqlite
+# Install system build dependencies for SQLite3 native compilation
+RUN apk add --no-cache python3 make g++ gcc sqlite git
 
 WORKDIR /app
 
-# Ensure data directory exists for persistent SQLite WAL storage
-RUN mkdir -p /app/data
-
-# Heredoc injection of the monolithic Node.js engine
-COPY <<-"EOF" /app/bot.js
-const fs = require('fs');
-const { execSync } = require('child_process');
-const path = require('path');
-
-// ==========================================
-// 1. RUNTIME AUTO-BOOTSTRAPPER
-// ==========================================
-// Safely check if core modules exist. If they don't, trigger install.
-const checkDependencies = () => {
-    try {
-        require.resolve('dotenv');
-        require.resolve('groq-sdk');
-        require.resolve('mineflayer');
-        return true;
-    } catch (e) {
-        return false;
-    }
-};
-
-if (!checkDependencies()) {
-    console.log("[SYSTEM] Missing dependencies detected. Initializing installation...");
-    if (!fs.existsSync('./package.json')) {
-        fs.writeFileSync('./package.json', JSON.stringify({
-            name: "enterprise-afk-bot-engine",
-            version: "1.0.0",
-            main: "bot.js",
-            type: "commonjs"
-        }));
-    }
-    
-    // Fixed: Using groq-sdk instead of @groq/groq-sdk
-    const deps = "express@^4.19.0 socket.io@^4.7.0 dotenv@^16.4.0 helmet@^7.1.0 cors@^2.8.5 " +
-        "mineflayer@^4.20.0 mineflayer-pathfinder@^2.4.0 mineflayer-auto-eat@^1.4.0 " +
-        "mineflayer-armor-manager@^2.0.1 mineflayer-collectblock@^1.6.0 mineflayer-pvp@^1.3.0 vec3@^0.1.10 " +
-        "groq-sdk@^0.5.0 bcryptjs@^2.4.3 express-session@^1.18.0 connect-sqlite3@^0.9.15 " +
-        "express-rate-limit@^7.2.0 sqlite3@^5.1.7 socks-proxy-agent@^8.0.3 axios@^1.6.8";
-        
-    console.log("[SYSTEM] Installing Dependencies... This will take a moment.");
-    execSync(`npm install ${deps}`, { stdio: 'inherit' });
+# Step 1: Inject Package Manifest
+RUN cat << 'EOF' > package.json
+{
+  "name": "enterprise-mineflayer-cluster",
+  "version": "2.5.0",
+  "description": "Multi-Tenant Minecraft Bot Engine & Dashboard",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "@groq/groq-sdk": "^0.5.0",
+    "axios": "^1.6.8",
+    "bcryptjs": "^2.4.3",
+    "connect-sqlite3": "^0.9.15",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.0",
+    "express": "^4.19.0",
+    "express-rate-limit": "^7.2.0",
+    "express-session": "^1.18.0",
+    "helmet": "^7.1.0",
+    "mineflayer": "^4.20.0",
+    "mineflayer-armor-manager": "^2.0.1",
+    "mineflayer-auto-eat": "^1.4.0",
+    "mineflayer-collectblock": "^1.6.0",
+    "mineflayer-pathfinder": "^2.4.0",
+    "mineflayer-pvp": "^1.3.0",
+    "socket.io": "^4.7.0",
+    "socks-proxy-agent": "^8.0.3",
+    "sqlite3": "^5.1.7",
+    "vec3": "^0.1.10"
+  }
 }
+EOF
 
-// ==========================================
-// 2. IMPORTS & ENVIRONMENT
-// ==========================================
+# Install Node dependencies
+RUN npm install --production
+
+# Step 2: Inject Complete Application Code (bot.js)
+RUN cat << 'EOF' > bot.js
+'use me strict';
+
+const fs = require('fs');
+const path = require('path');
+const http = require('http');
+const { execSync } = require('child_process');
+
+// Dynamic Auto-Bootstrapper & Dependency Auto-Installer
+const REQUIRED_MODULES = [
+  'express', 'socket.io', 'dotenv', 'helmet', 'cors', 'mineflayer',
+  'mineflayer-pathfinder', 'mineflayer-auto-eat', 'mineflayer-armor-manager',
+  'mineflayer-collectblock', 'mineflayer-pvp', 'vec3', '@groq/groq-sdk',
+  'bcryptjs', 'express-session', 'connect-sqlite3', 'express-rate-limit',
+  'sqlite3', 'socks-proxy-agent', 'axios'
+];
+
+(function autoInstallDependencies() {
+  const missing = [];
+  for (const mod of REQUIRED_MODULES) {
+    try {
+      require(mod);
+    } catch (e) {
+      missing.push(mod);
+    }
+  }
+  if (missing.length > 0) {
+    console.log(`[BOOTSTRAP] Missing dependencies detected: ${missing.join(', ')}. Auto-installing...`);
+    try {
+      execSync(`npm install --production ${missing.join(' ')}`, { stdio: 'inherit' });
+      console.log('[BOOTSTRAP] Dependencies successfully installed.');
+    } catch (err) {
+      console.error('[BOOTSTRAP CRITICAL] Dependency auto-installer failed:', err);
+    }
+  }
+})();
+
+// Imports
 require('dotenv').config();
 const express = require('express');
-const http = require('http');
 const { Server } = require('socket.io');
 const helmet = require('helmet');
 const cors = require('cors');
@@ -68,636 +95,1046 @@ const rateLimit = require('express-rate-limit');
 const sqlite3 = require('sqlite3').verbose();
 const { SocksProxyAgent } = require('socks-proxy-agent');
 const axios = require('axios');
-const Groq = require('groq-sdk'); // Fixed import
+const Groq = require('@groq/groq-sdk');
 const mineflayer = require('mineflayer');
-const { pathfinder, Movements, goals } = require('mineflayer-pathfinder');
-const autoeat = require('mineflayer-auto-eat').plugin;
+const pathfinder = require('mineflayer-pathfinder').pathfinder;
+const { Movements, goals } = require('mineflayer-pathfinder');
+const autoEat = require('mineflayer-auto-eat').plugin;
 const armorManager = require('mineflayer-armor-manager');
 const collectBlock = require('mineflayer-collectblock').plugin;
 const pvp = require('mineflayer-pvp').plugin;
-const { Vec3 } = require('vec3');
+const vec3 = require('vec3');
 
+// Configurations & Environment
+const PORT = process.env.PORT || 3000;
+const SESSION_SECRET = process.env.SESSION_SECRET || 'super-secret-cluster-key-9988';
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'AdminPass123!';
+const GROQ_API_KEY = process.env.GROQ_API_KEY || '';
+
+// Initialize SQLite Database with WAL Mode
+const DATA_DIR = path.join(__dirname, 'data');
+if (!fs.existsSync(DATA_DIR)) {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+}
+const DB_PATH = path.join(DATA_DIR, 'system.db');
+const db = new sqlite3.Database(DB_PATH);
+
+db.serialize(() => {
+  db.run('PRAGMA journal_mode = WAL;');
+  db.run('PRAGMA synchronous = NORMAL;');
+
+  db.run(`CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT UNIQUE NOT NULL,
+    password TEXT NOT NULL,
+    role TEXT NOT NULL DEFAULT 'subscriber',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )`);
+
+  db.run(`CREATE TABLE IF NOT EXISTS bots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner_id INTEGER NOT NULL,
+    username TEXT NOT NULL,
+    host TEXT NOT NULL,
+    port INTEGER NOT NULL DEFAULT 25565,
+    version TEXT DEFAULT 'auto',
+    auth_mode TEXT DEFAULT 'offline',
+    proxy TEXT DEFAULT '',
+    auto_auth_pass TEXT DEFAULT '',
+    webhook_url TEXT DEFAULT '',
+    is_active INTEGER DEFAULT 0,
+    FOREIGN KEY(owner_id) REFERENCES users(id)
+  )`);
+
+  db.run(`CREATE TABLE IF NOT EXISTS proxies (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    proxy_str TEXT UNIQUE NOT NULL,
+    status TEXT DEFAULT 'UNKNOWN',
+    latency INTEGER DEFAULT 0
+  )`);
+
+  db.run(`CREATE TABLE IF NOT EXISTS macros (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    dsl_code TEXT NOT NULL
+  )`);
+
+  // Seed Admin Account
+  db.get('SELECT * FROM users WHERE role = ?', ['admin'], (err, row) => {
+    if (!row) {
+      const hash = bcrypt.hashSync(ADMIN_PASSWORD, 12);
+      db.run('INSERT INTO users (username, password, role) VALUES (?, ?, ?)', ['admin', hash, 'admin'], (e) => {
+        if (!e) console.log('[DB] Default Admin account created. Username: admin');
+      });
+    }
+  });
+});
+
+// Express App Architecture & Middleware Setup
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server, { pingInterval: 20000, pingTimeout: 45000 });
-const PORT = process.env.PORT || 3000;
-let groq;
-
-try {
-    // Safe initialization in case key is missing
-    groq = new Groq({ apiKey: process.env.GROQ_API_KEY || 'MISSING_KEY' });
-} catch (e) {
-    console.warn("[SYSTEM] Groq API SDK initialized without a valid key. AI features will be disabled.");
-}
-
-// ==========================================
-// 3. DATABASE (WAL MODE) & SCHEMAS
-// ==========================================
-const dbPath = path.join(__dirname, 'data', 'system.db');
-const db = new sqlite3.Database(dbPath);
-db.serialize(() => {
-    db.run("PRAGMA journal_mode = WAL;");
-    db.run("PRAGMA synchronous = NORMAL;");
-    db.run(`CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, username TEXT UNIQUE, password TEXT, role TEXT)`);
-    db.run(`CREATE TABLE IF NOT EXISTS bots (id INTEGER PRIMARY KEY, owner_id INTEGER, name TEXT, host TEXT, port INTEGER, version TEXT, auth_mode TEXT, proxy TEXT, is_active INTEGER DEFAULT 1)`);
-    db.run(`CREATE TABLE IF NOT EXISTS system_logs (id INTEGER PRIMARY KEY, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP, type TEXT, message TEXT)`);
-    // Seed Admin
-    db.get("SELECT * FROM users WHERE username = 'admin'", async (err, row) => {
-        if (!row) {
-            const hash = await bcrypt.hash(process.env.ADMIN_PASSWORD || 'admin', 12);
-            db.run("INSERT INTO users (username, password, role) VALUES (?, ?, ?)", ['admin', hash, 'admin']);
-        }
-    });
+const io = new Server(server, {
+  pingInterval: 20000,
+  pingTimeout: 45000,
+  cors: { origin: '*', methods: ['GET', 'POST'] }
 });
 
-// ==========================================
-// 4. EMBEDDED FRONTEND UI (SPA)
-// ==========================================
-const FRONTEND_HTML = `
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Enterprise AFK Bot Engine</title>
-    <script src="/socket.io/socket.io.js"></script>
-    <style>
-        :root { --bg: #0f0f13; --panel: rgba(25,25,30,0.6); --border: rgba(255,255,255,0.1); --text: #eee; --accent: #00ffcc; }
-        body.theme-dracula { --bg: #282a36; --panel: rgba(68,71,90,0.6); --accent: #ff79c6; }
-        body.theme-cyber { --bg: #000; --panel: rgba(0,20,0,0.6); --accent: #ff003c; border-color: #00ff00;}
-        body { margin: 0; font-family: 'Segoe UI', system-ui; background: var(--bg); color: var(--text); overflow-x: hidden; }
-        .glass { background: var(--panel); backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px); border: 1px solid var(--border); border-radius: 12px; }
-        .grid-layout { display: grid; grid-template-columns: 300px 1fr 350px; gap: 15px; padding: 15px; height: 95vh; }
-        .panel { display: flex; flex-direction: column; padding: 15px; overflow-y: auto; }
-        h2 { margin-top:0; color: var(--accent); font-size: 1.1rem; text-transform: uppercase; letter-spacing: 1px;}
-        input, select, button { background: rgba(0,0,0,0.3); border: 1px solid var(--border); color: var(--text); padding: 8px 12px; border-radius: 6px; outline: none; margin-bottom: 8px; width: 100%; box-sizing: border-box; }
-        button { background: var(--accent); color: #000; font-weight: bold; cursor: pointer; transition: 0.2s; }
-        button:hover { opacity: 0.8; transform: scale(0.98); }
-        .bot-card { display: flex; align-items: center; gap: 10px; padding: 10px; background: rgba(0,0,0,0.4); border-radius: 8px; margin-bottom: 10px; cursor: pointer;}
-        .bot-card img { width: 40px; height: 40px; border-radius: 4px; }
-        .bot-stats { font-size: 0.8rem; color: #aaa; }
-        .bot-stats span { display: inline-block; margin-right: 8px; }
-        .status { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
-        .status.connected { background: #00ff00; box-shadow: 0 0 8px #00ff00; }
-        .status.disconnected { background: #ff0000; box-shadow: 0 0 8px #ff0000; }
-        #terminal { flex: 1; background: rgba(0,0,0,0.8); font-family: 'Courier New', monospace; font-size: 0.85rem; padding: 10px; overflow-y: auto; color: #0f0; border-radius: 8px; margin-bottom:10px; }
-        .log-sys { color: #8be9fd; } .log-err { color: #ff5555; } .log-chat { color: #f1fa8c; } .log-ai { color: #bd93f9; }
-        #radar-container { display:flex; justify-content:center; margin-bottom: 15px;}
-        canvas#radar { background: rgba(0,0,0,0.5); border-radius: 50%; border: 2px solid var(--accent); }
-        .inv-grid { display: grid; grid-template-columns: repeat(9, 1fr); gap: 2px; background: #8b8b8b; padding: 4px; border: 2px solid #373737; }
-        .inv-slot { aspect-ratio: 1; background: #8b8b8b; border-top: 2px solid #fff; border-left: 2px solid #fff; border-bottom: 2px solid #373737; border-right: 2px solid #373737; position: relative;}
-        .inv-slot img { width: 100%; height: 100%; image-rendering: pixelated; }
-        .inv-count { position: absolute; bottom: 0; right: 2px; font-size: 0.7rem; font-weight: bold; color: white; text-shadow: 1px 1px 0 #000; }
-        #finny { position: fixed; bottom: 20px; right: 20px; width: 60px; height: 60px; background: var(--accent); border-radius: 30px; cursor: pointer; box-shadow: 0 8px 16px rgba(0,0,0,0.3); z-index: 100; transition: width 0.3s, height 0.3s, border-radius 0.3s; overflow: hidden; display:flex; align-items:center; justify-content:center; font-weight:bold; color:#000; }
-        #finny.expanded { width: 300px; height: 400px; border-radius: 12px; flex-direction: column; padding: 10px; align-items:stretch; justify-content:flex-start;}
-        #finny-chat { flex:1; overflow-y:auto; font-size: 0.85rem; margin-bottom:10px; display:none; }
-        #finny.expanded #finny-chat { display:block; }
-        #finny-input { display:none; width: 100%; box-sizing: border-box; }
-        #finny.expanded #finny-input { display:block; }
-        #finny.expanded .finny-icon { display: none; }
-        /* Auth Overlay */
-        #auth-overlay { position: fixed; top:0; left:0; width: 100vw; height: 100vh; background: rgba(0,0,0,0.9); display:flex; align-items:center; justify-content:center; z-index: 9999; }
-        #auth-box { width: 300px; }
-    </style>
-</head>
-<body>
-    <div id="auth-overlay" class="glass">
-        <div id="auth-box" class="glass panel">
-            <h2>Authentication</h2>
-            <input type="text" id="auth-user" placeholder="Username">
-            <input type="password" id="auth-pass" placeholder="Password">
-            <button onclick="login()">Login</button>
-            <div id="auth-err" style="color:red; font-size:0.8rem; margin-top:5px;"></div>
-        </div>
-    </div>
-
-    <div class="grid-layout">
-        <div class="glass panel">
-            <h2>Bot Cluster</h2>
-            <div id="bot-list"></div>
-            <h2 style="margin-top:20px;">Deploy Bot</h2>
-            <input type="text" id="new-bot-name" placeholder="Username / Email">
-            <input type="text" id="new-bot-host" placeholder="Server IP">
-            <input type="number" id="new-bot-port" placeholder="Port" value="25565">
-            <select id="new-bot-ver"><option value="false">Auto Version</option><option value="1.20.4">1.20.4</option><option value="1.19.4">1.19.4</option><option value="1.18.2">1.18.2</option><option value="1.8.9">1.8.9</option></select>
-            <select id="new-bot-auth"><option value="offline">Offline / Cracked</option><option value="microsoft">Microsoft (OAuth)</option></select>
-            <input type="text" id="new-bot-proxy" placeholder="Proxy (host:port)">
-            <button onclick="deployBot()">Deploy Instance</button>
-            <h2 style="margin-top:20px;">Settings</h2>
-            <select id="theme-select" onchange="document.body.className = 'theme-' + this.value">
-                <option value="default">Default Dark</option>
-                <option value="dracula">Dracula</option>
-                <option value="cyber">Cyberpunk</option>
-            </select>
-        </div>
-
-        <div class="glass panel" style="padding:0;">
-            <div id="terminal"></div>
-            <input type="text" id="term-input" placeholder="Enter /command or message... (Press Enter)" style="margin:10px; width:calc(100% - 20px); border-radius:0;">
-        </div>
-
-        <div class="glass panel">
-            <h2>Spatial Radar (32b)</h2>
-            <div id="radar-container"><canvas id="radar" width="200" height="200"></canvas></div>
-            <h2>Inventory Grid</h2>
-            <div class="inv-grid" id="inventory"></div>
-            <h2 style="margin-top:15px;">Selected Bot Stats</h2>
-            <div id="active-bot-stats" class="bot-stats">Select a bot to view telemetry.</div>
-        </div>
-    </div>
-
-    <div id="finny" onclick="toggleFinny(event)">
-        <span class="finny-icon">🐟</span>
-        <div id="finny-chat"><b>Finny AI:</b> How can I orchestrate the cluster for you today?</div>
-        <input type="text" id="finny-input" placeholder="Ask Finny..." onkeypress="if(event.key==='Enter') sendFinny(event)">
-    </div>
-
-    <script>
-        const socket = io({ autoConnect: false });
-        let token = localStorage.getItem('token');
-        let selectedBot = null;
-        let radarEntities = [];
-        
-        // Audio Synth
-        const AudioContext = window.AudioContext || window.webkitAudioContext;
-        const audioCtx = new AudioContext();
-        function playSound(type) {
-            if(audioCtx.state === 'suspended') audioCtx.resume();
-            const osc = audioCtx.createOscillator();
-            const gain = audioCtx.createGain();
-            osc.connect(gain); gain.connect(audioCtx.destination);
-            if(type==='connect'){ osc.type='sine'; osc.frequency.setValueAtTime(440, audioCtx.currentTime); osc.frequency.exponentialRampToValueAtTime(880, audioCtx.currentTime + 0.1); gain.gain.setValueAtTime(0.1, audioCtx.currentTime); gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.5); osc.start(); osc.stop(audioCtx.currentTime + 0.5); }
-            if(type==='disconnect'){ osc.type='sawtooth'; osc.frequency.setValueAtTime(200, audioCtx.currentTime); osc.frequency.linearRampToValueAtTime(50, audioCtx.currentTime + 0.3); gain.gain.setValueAtTime(0.1, audioCtx.currentTime); gain.gain.linearRampToValueAtTime(0.01, audioCtx.currentTime + 0.3); osc.start(); osc.stop(audioCtx.currentTime + 0.3); }
-            if(type==='msg'){ osc.type='square'; osc.frequency.setValueAtTime(600, audioCtx.currentTime); gain.gain.setValueAtTime(0.05, audioCtx.currentTime); gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.1); osc.start(); osc.stop(audioCtx.currentTime + 0.1); }
-        }
-
-        async function login() {
-            const u = document.getElementById('auth-user').value;
-            const p = document.getElementById('auth-pass').value;
-            const res = await fetch('/api/login', { method: 'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({u,p})});
-            if(res.ok) { const data = await res.json(); token = data.token; localStorage.setItem('token', token); document.getElementById('auth-overlay').style.display='none'; initSocket(); }
-            else { document.getElementById('auth-err').innerText = "Invalid credentials"; }
-        }
-
-        if(token) { document.getElementById('auth-overlay').style.display='none'; initSocket(); }
-
-        function initSocket() {
-            socket.io.opts.query = { token };
-            socket.connect();
-            
-            socket.on('log', (data) => {
-                const term = document.getElementById('terminal');
-                const div = document.createElement('div');
-                div.className = 'log-' + data.type;
-                div.innerText = \`[\${new Date().toLocaleTimeString()}] \${data.msg}\`;
-                term.appendChild(div);
-                if(term.childElementCount > 1500) term.removeChild(term.firstChild);
-                term.scrollTop = term.scrollHeight;
-                if(data.type === 'chat') playSound('msg');
-            });
-
-            socket.on('bots_update', (bots) => {
-                const list = document.getElementById('bot-list');
-                list.innerHTML = '';
-                bots.forEach(b => {
-                    const div = document.createElement('div');
-                    div.className = 'bot-card';
-                    div.onclick = () => selectBot(b);
-                    div.innerHTML = \`<img src="https://crafatar.com/renders/head/\${b.uuid || '8667ba71-b85a-4004-af54-457a9734eed7'}" crossorigin="anonymous">
-                    <div style="flex:1">
-                        <div style="font-weight:bold;">\${b.name} <span class="status \${b.status}"></span></div>
-                        <div class="bot-stats">❤ \${b.health||20} | 🍗 \${b.food||20} | \${b.host}</div>
-                    </div>\`;
-                    list.appendChild(div);
-                });
-            });
-
-            socket.on('radar_data', (data) => {
-                if(selectedBot && selectedBot.name === data.bot) radarEntities = data.entities;
-            });
-            
-            socket.on('inventory_data', (data) => {
-                if(selectedBot && selectedBot.name === data.bot) renderInventory(data.items);
-            });
-        }
-
-        function selectBot(b) {
-            selectedBot = b;
-            document.getElementById('active-bot-stats').innerHTML = \`
-                Position: X:\${b.pos?.x||0} Y:\${b.pos?.y||0} Z:\${b.pos?.z||0}<br>
-                Dimension: \${b.dimension||'Overworld'}<br>
-                Ping: \${b.ping||0}ms<br>Proxy: \${b.proxy || 'None'}
-            \`;
-            socket.emit('request_inventory', b.name);
-        }
-
-        function deployBot() {
-            socket.emit('command', \`/add \${document.getElementById('new-bot-name').value} \${document.getElementById('new-bot-host').value} \${document.getElementById('new-bot-port').value} \${document.getElementById('new-bot-ver').value} \${document.getElementById('new-bot-auth').value} \${document.getElementById('new-bot-proxy').value}\`);
-        }
-
-        document.getElementById('term-input').addEventListener('keypress', (e) => {
-            if(e.key === 'Enter') {
-                const val = e.target.value;
-                if(val.startsWith('/')) socket.emit('command', val);
-                else if (selectedBot) socket.emit('command', \`/say \${selectedBot.name} \${val}\`);
-                e.target.value = '';
-            }
-        });
-
-        // 2D Radar Canvas Loop
-        const canvas = document.getElementById('radar');
-        const ctx = canvas.getContext('2d');
-        function drawRadar() {
-            ctx.clearRect(0, 0, canvas.width, canvas.height);
-            ctx.strokeStyle = 'rgba(0, 255, 204, 0.2)';
-            ctx.beginPath(); ctx.arc(100, 100, 100, 0, Math.PI*2); ctx.stroke();
-            ctx.beginPath(); ctx.arc(100, 100, 50, 0, Math.PI*2); ctx.stroke();
-            
-            // Draw Bot Center
-            ctx.fillStyle = '#00ffcc';
-            ctx.beginPath(); ctx.arc(100, 100, 3, 0, Math.PI*2); ctx.fill();
-
-            radarEntities.forEach(e => {
-                // Map relative coordinates (scale: 32 blocks = 100px radius -> ~3px per block)
-                const rx = (e.x) * 3;
-                const rz = (e.z) * 3;
-                const px = 100 + rx;
-                const py = 100 + rz;
-                if(Math.hypot(rx, rz) > 100) return; // limit to 32b
-                
-                ctx.fillStyle = e.type === 'player' ? '#0ff' : e.type === 'hostile' ? '#f00' : e.type === 'item' ? '#ff0' : '#0f0';
-                ctx.beginPath(); ctx.arc(px, py, 2, 0, Math.PI*2); ctx.fill();
-            });
-            requestAnimationFrame(drawRadar);
-        }
-        drawRadar();
-
-        // Inventory Render
-        function renderInventory(items) {
-            const grid = document.getElementById('inventory');
-            grid.innerHTML = '';
-            for(let i=9; i<45; i++) {
-                const item = items.find(x => x.slot === i);
-                const slotDiv = document.createElement('div');
-                slotDiv.className = 'inv-slot';
-                if(item) {
-                    slotDiv.innerHTML = \`<img src="https://raw.githubusercontent.com/PrismarineJS/minecraft-assets/master/data/1.19.4/items/\${item.name}.png" onerror="this.style.display='none'">
-                    <div class="inv-count">\${item.count>1?item.count:''}</div>\`;
-                }
-                grid.appendChild(slotDiv);
-            }
-        }
-
-        // Finny AI UI
-        function toggleFinny(e) {
-            if(e.target.id === 'finny-input') return;
-            const f = document.getElementById('finny');
-            f.classList.toggle('expanded');
-        }
-        function sendFinny(e) {
-            const inp = document.getElementById('finny-input');
-            const chat = document.getElementById('finny-chat');
-            chat.innerHTML += \`<br><b style="color:#000">You:</b> \${inp.value}\`;
-            socket.emit('ai_request', inp.value);
-            inp.value = '';
-            chat.scrollTop = chat.scrollHeight;
-        }
-        socket.on('ai_response', msg => {
-            const chat = document.getElementById('finny-chat');
-            chat.innerHTML += \`<br><b style="color:#fff">Finny:</b> \${msg}\`;
-            chat.scrollTop = chat.scrollHeight;
-        });
-
-    </script>
-</body>
-</html>
-`;
-
-// ==========================================
-// 5. EXPRESS & MIDDLEWARE
-// ==========================================
-app.use(helmet({ contentSecurityPolicy: false })); 
+app.use(helmet({ contentSecurityPolicy: false }));
 app.use(cors());
 app.use(express.json());
-app.use(session({
-    store: new SQLiteStore({ dir: './data', db: 'sessions.db' }),
-    secret: process.env.SESSION_SECRET || 'fallback_enterprise_secret_99',
-    resave: false,
-    saveUninitialized: false,
-    cookie: { secure: false, maxAge: 7 * 24 * 60 * 60 * 1000 }
-}));
+app.use(express.urlencoded({ extended: true }));
 
-const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 5 });
-app.post('/api/login', authLimiter, (req, res) => {
-    db.get("SELECT * FROM users WHERE username = ?", [req.body.u], (err, row) => {
-        if (row && bcrypt.compareSync(req.body.p, row.password)) {
-            req.session.userId = row.id;
-            req.session.role = row.role;
-            const token = Buffer.from(`${row.id}:${row.role}:${Date.now()}`).toString('base64');
-            res.json({ success: true, token });
-        } else {
-            res.status(401).json({ error: 'Unauthorized' });
-        }
-    });
+const sessionMiddleware = session({
+  store: new SQLiteStore({ db: 'system.db', dir: DATA_DIR }),
+  secret: SESSION_SECRET,
+  resave: false,
+  saveUninitialized: false,
+  cookie: { maxAge: 7 * 24 * 60 * 60 * 1000, secure: false }
 });
 
-app.get('/', (req, res) => res.send(FRONTEND_HTML));
+app.use(sessionMiddleware);
+io.engine.use(sessionMiddleware);
 
-// ==========================================
-// 6. MINEFLAYER CLUSTER ORCHESTRATOR
-// ==========================================
-class BotCluster {
-    constructor() {
-        this.bots = new Map();
-        this.reconnectAttempts = new Map();
-    }
+// Rate Limiters
+const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 5, message: { error: 'Too many auth attempts' } });
+const apiLimiter = rateLimit({ windowMs: 1 * 60 * 1000, max: 40 });
+app.use('/api/auth/', authLimiter);
+app.use('/api/', apiLimiter);
 
-    async spawn(config, emitLog) {
-        if (this.bots.has(config.name)) return emitLog('err', `Bot ${config.name} already exists.`);
-        emitLog('sys', `Initializing bot ${config.name} -> ${config.host}:${config.port}`);
-        
-        let proxyAgent = null;
-        if (config.proxy && config.proxy !== 'undefined' && config.proxy !== '') {
-            try {
-                proxyAgent = new SocksProxyAgent(`socks5://${config.proxy}`);
-                emitLog('sys', `Routing ${config.name} via SOCKS5: ${config.proxy}`);
-            } catch (e) { emitLog('err', `Proxy Error: ${e.message}`); }
-        }
-
-        const botOpts = {
-            host: config.host,
-            port: parseInt(config.port) || 25565,
-            username: config.name,
-            version: config.version === 'false' ? false : config.version,
-            auth: config.auth_mode,
-            agent: proxyAgent,
-            hideErrors: true
-        };
-
-        let bot;
-        try { bot = mineflayer.createBot(botOpts); } 
-        catch (err) { return emitLog('err', `Spawn failed: ${err.message}`); }
-
-        const botState = { 
-            instance: bot, 
-            config, 
-            status: 'connecting',
-            health: 20, food: 20, pos: {x:0,y:0,z:0}, ping: 0, uuid: null,
-            intervals: []
-        };
-        this.bots.set(config.name, botState);
-
-        bot.loadPlugin(pathfinder);
-        bot.loadPlugin(autoeat);
-        bot.loadPlugin(armorManager);
-        bot.loadPlugin(collectBlock);
-        bot.loadPlugin(pvp);
-
-        bot.on('login', () => {
-            botState.status = 'connected';
-            botState.uuid = bot.player?.uuid;
-            this.reconnectAttempts.set(config.name, 0);
-            emitLog('sys', `[${config.name}] Joined game.`);
-            
-            // Auto Eat Config
-            bot.autoEat.options.priority = "foodPoints";
-            bot.autoEat.options.bannedFood = ["rotten_flesh", "spider_eye", "poisonous_potato", "pufferfish"];
-            bot.autoEat.options.startAt = 14;
-
-            // Anti-AFK Engine (Heuristic)
-            botState.intervals.push(setInterval(() => {
-                if(Math.random() > 0.5) {
-                    bot.setControlState('sneak', true);
-                    setTimeout(() => bot.setControlState('sneak', false), 400 + Math.random()*500);
-                }
-                const yaw = bot.entity.yaw + (Math.random() - 0.5);
-                const pitch = bot.entity.pitch + (Math.random() - 0.5) * 0.5;
-                bot.look(yaw, pitch, true);
-                if(Math.random() > 0.8) bot.setControlState('jump', true);
-                setTimeout(() => bot.setControlState('jump', false), 100);
-            }, 30000 + Math.random() * 60000)); // Every 30-90s
-
-            // Spatial Radar Tick
-            botState.intervals.push(setInterval(() => {
-                if(!bot.entity) return;
-                botState.pos = bot.entity.position;
-                const entities = Object.values(bot.entities).map(e => {
-                    if(e === bot.entity) return null;
-                    const type = e.type === 'player' ? 'player' : (e.kind === 'Hostile mobs' ? 'hostile' : (e.type === 'object' ? 'item' : 'passive'));
-                    return { x: e.position.x - botState.pos.x, z: e.position.z - botState.pos.z, type };
-                }).filter(Boolean);
-                io.emit('radar_data', { bot: config.name, entities });
-            }, 1000)); // 1 Hz radar
-        });
-
-        bot.on('health', () => {
-            botState.health = Math.round(bot.health);
-            botState.food = Math.round(bot.food);
-            // Hazard Guard
-            if(bot.health <= 6) emitLog('err', `[${config.name}] LOW HEALTH WARNING!`);
-            const blockUnder = bot.blockAt(bot.entity.position.offset(0, -1, 0));
-            if(blockUnder && (blockUnder.name.includes('lava') || blockUnder.name.includes('fire'))) {
-                emitLog('sys', `[${config.name}] Hazard detected. Attempting escape.`);
-                const p = bot.entity.position;
-                bot.pathfinder.setGoal(new goals.GoalNear(p.x + 3, p.y, p.z + 3, 1));
-            }
-        });
-
-        bot.on('messagestr', async (msg) => {
-            emitLog('chat', `[${config.name}] ${msg}`);
-            // Auto-Auth Interceptor
-            if(/(register|login|Please log in|Type \/auth)/i.test(msg)) {
-                setTimeout(() => {
-                    bot.chat(`/login ${process.env.ADMIN_PASSWORD || 'secret'}`);
-                    bot.chat(`/register ${process.env.ADMIN_PASSWORD || 'secret'} ${process.env.ADMIN_PASSWORD || 'secret'}`);
-                }, 800 + Math.random() * 1400);
-            }
-            
-            // In-Game NLP (Groq)
-            if(msg.includes('!ai ') && groq) {
-                const prompt = msg.split('!ai ')[1];
-                try {
-                    const chatCompletion = await groq.chat.completions.create({
-                        messages: [{ role: 'user', content: `You are a Minecraft bot named ${config.name}. Reply in under 200 chars to: ${prompt}` }],
-                        model: 'llama-3.3-70b-versatile',
-                    });
-                    bot.chat(chatCompletion.choices[0]?.message?.content || 'AI unavailable');
-                } catch(e) {
-                    emitLog('err', `[${config.name}] Groq API Error: ${e.message}`);
-                }
-            }
-        });
-
-        bot.on('kicked', (reason) => emitLog('err', `[${config.name}] Kicked: ${reason}`));
-        bot.on('error', (err) => emitLog('err', `[${config.name}] Error: ${err.message}`));
-        bot.on('end', (reason) => {
-            botState.status = 'disconnected';
-            botState.intervals.forEach(clearInterval);
-            bot.removeAllListeners();
-            emitLog('sys', `[${config.name}] Disconnected. (${reason})`);
-            
-            // Jittered Exponential Backoff Reconnect
-            let attempts = this.reconnectAttempts.get(config.name) || 0;
-            if(attempts < 10) {
-                attempts++;
-                this.reconnectAttempts.set(config.name, attempts);
-                const delay = Math.min(3000 * Math.pow(1.5, attempts) + Math.random() * 1000, 180000);
-                emitLog('sys', `[${config.name}] Reconnecting in ${Math.round(delay/1000)}s... (Attempt ${attempts})`);
-                setTimeout(() => {
-                    this.bots.delete(config.name);
-                    this.spawn(config, emitLog);
-                }, delay);
-            }
-        });
-    }
-
-    async runMacro(botName, script, emitLog) {
-        const botState = this.bots.get(botName);
-        if(!botState) return emitLog('err', 'Bot not found for macro.');
-        const bot = botState.instance;
-        const lines = script.split('\n');
-        for (let line of lines) {
-            const parts = line.trim().split(' ');
-            const cmd = parts[0].toUpperCase();
-            try {
-                if(cmd === 'DELAY') await new Promise(r => setTimeout(r, parseInt(parts[1])));
-                if(cmd === 'SAY') bot.chat(parts.slice(1).join(' '));
-                if(cmd === 'MOVE') {
-                    bot.setControlState(parts[1].toLowerCase(), true);
-                    await new Promise(r => setTimeout(r, parseInt(parts[2])));
-                    bot.setControlState(parts[1].toLowerCase(), false);
-                }
-                if(cmd === 'LOOK') await bot.look(parseFloat(parts[1]), parseFloat(parts[2]), true);
-                if(cmd === 'DROP_ALL') {
-                    const items = bot.inventory.items();
-                    for(let item of items) { await bot.tossStack(item); await new Promise(r=>setTimeout(r,500)); }
-                }
-            } catch(e) { emitLog('err', `Macro Error on ${line}: ${e.message}`); }
-        }
-    }
-
-    remove(botName) {
-        const botState = this.bots.get(botName);
-        if(botState) {
-            botState.intervals.forEach(clearInterval);
-            this.reconnectAttempts.set(botName, 999); // Prevent auto-reconnect
-            botState.instance.quit('Terminated by Dashboard');
-            this.bots.delete(botName);
-        }
-    }
-
-    getClusterData() {
-        return Array.from(this.bots.values()).map(b => ({
-            name: b.config.name, host: b.config.host, status: b.status,
-            health: b.health, food: b.food, pos: b.pos, ping: b.instance?.player?.ping, uuid: b.uuid,
-            dimension: b.instance?.game?.dimension, proxy: b.config.proxy
-        }));
-    }
+// Authentication & Auth RBAC Middlewares
+function requireAuth(req, res, next) {
+  if (req.session && req.session.user) return next();
+  return res.status(401).json({ error: 'Unauthorized' });
+}
+function requireAdmin(req, res, next) {
+  if (req.session && req.session.user && req.session.user.role === 'admin') return next();
+  return res.status(403).json({ error: 'Forbidden: Admin access required' });
 }
 
-const cluster = new BotCluster();
-
-// ==========================================
-// 7. WEBSOCKET CONTROLLER (Socket.io)
-// ==========================================
-io.use((socket, next) => {
-    const token = socket.handshake.query.token;
-    if(token) return next();
-    return next(new Error('Authentication error'));
+// REST Endpoints
+app.post('/api/auth/login', (req, res) => {
+  const { username, password } = req.body;
+  db.get('SELECT * FROM users WHERE username = ?', [username], (err, user) => {
+    if (err || !user) return res.status(401).json({ error: 'Invalid credentials' });
+    if (!bcrypt.compareSync(password, user.password)) return res.status(401).json({ error: 'Invalid credentials' });
+    req.session.user = { id: user.id, username: user.username, role: user.role };
+    return res.json({ success: true, user: req.session.user });
+  });
 });
 
+app.post('/api/auth/logout', (req, res) => {
+  req.session.destroy();
+  res.json({ success: true });
+});
+
+app.get('/api/auth/me', (req, res) => {
+  if (req.session && req.session.user) return res.json({ user: req.session.user });
+  res.status(401).json({ error: 'Unauthenticated' });
+});
+
+// Mineflayer Active Cluster Manager Map
+const clusterManager = new Map(); // Key: Bot DB ID -> Bot Managed Instance
+
+// Groq AI Integration
+const groq = GROQ_API_KEY ? new Groq({ apiKey: GROQ_API_KEY }) : null;
+const aiContexts = new Map(); // Key: username -> context array
+
+async function queryGroqAI(prompt, userContextKey = 'global') {
+  if (!groq) return 'Groq AI Service not configured (Missing GROQ_API_KEY).';
+  try {
+    let history = aiContexts.get(userContextKey) || [];
+    history.push({ role: 'user', content: prompt });
+    if (history.length > 10) history = history.slice(history.length - 10);
+    
+    const response = await groq.chat.completions.create({
+      messages: [
+        { role: 'system', content: 'You are Finny, an elite Minecraft AFK Cluster AI Engine. Keep response under 250 chars for in-game chat.' },
+        ...history
+      ],
+      model: 'llama-3.3-70b-versatile',
+      temperature: 0.7,
+      max_tokens: 150
+    });
+    const reply = response.choices[0]?.message?.content || 'AI response generation empty.';
+    history.push({ role: 'assistant', content: reply });
+    aiContexts.set(userContextKey, history);
+    return reply;
+  } catch (err) {
+    return `AI Error: ${err.message}`;
+  }
+}
+
+// Discord Webhook Dispatcher
+async function sendDiscordWebhook(url, title, description, color = 0x00FF00) {
+  if (!url || !url.startsWith('http')) return;
+  try {
+    await axios.post(url, {
+      embeds: [{ title, description, color: color, timestamp: new Date().toISOString() }]
+    });
+  } catch (e) {
+    console.error('[WEBHOOK ERROR]', e.message);
+  }
+}
+
+// Bot Class & Lifecycle Engine
+class ClusterBotInstance {
+  constructor(config) {
+    this.config = config; // DB row data
+    this.bot = null;
+    this.reconnectAttempts = 0;
+    this.reconnectTimer = null;
+    this.antiAfkInterval = null;
+    this.telemetryInterval = null;
+    this.logs = [];
+    this.status = 'DISCONNECTED';
+    this.radarData = [];
+  }
+
+  log(category, message) {
+    const entry = { timestamp: new Date().toLocaleTimeString(), category, message };
+    this.logs.push(entry);
+    if (this.logs.length > 1500) this.logs.shift();
+    io.emit('bot_log', { botId: this.config.id, log: entry });
+  }
+
+  spawn() {
+    this.status = 'AUTHENTICATING';
+    this.log('System', `Initiating cluster spawn sequence to ${this.config.host}:${this.config.port}...`);
+    
+    const options = {
+      host: this.config.host,
+      port: parseInt(this.config.port),
+      username: this.config.username,
+      version: this.config.version === 'auto' ? false : this.config.version,
+      auth: this.config.auth_mode === 'microsoft' ? 'microsoft' : 'offline'
+    };
+
+    if (this.config.proxy) {
+      options.agent = new SocksProxyAgent(this.config.proxy);
+    }
+
+    try {
+      this.bot = mineflayer.createBot(options);
+    } catch (err) {
+      this.log('Bot Error', `Spawn Exception: ${err.message}`);
+      this.scheduleReconnection();
+      return;
+    }
+
+    // Attach Mineflayer Plugins
+    this.bot.loadPlugin(pathfinder);
+    this.bot.loadPlugin(autoEat);
+    this.bot.loadPlugin(armorManager);
+    this.bot.loadPlugin(collectBlock);
+    this.bot.loadPlugin(pvp);
+
+    // Event Registration
+    this.bot.once('spawn', () => {
+      this.status = 'CONNECTED';
+      this.reconnectAttempts = 0;
+      this.log('System', `Successfully spawned and joined target world!`);
+      
+      // Auto Armor & Auto Eat Setup
+      this.bot.armorManager.enable();
+      this.bot.autoEat.options = {
+        priority: 'foodPoints',
+        startAt: 14,
+        bannedFood: ['rotten_flesh', 'poisonous_potato', 'pufferfish', 'spider_eye']
+      };
+
+      this.startAntiAfkEngine();
+      this.startTelemetryPump();
+      db.run('UPDATE bots SET is_active = 1 WHERE id = ?', [this.config.id]);
+    });
+
+    this.bot.on('chat', (username, message) => {
+      if (username === this.bot.username) return;
+      this.log('Chat', `<${username}> ${message}`);
+      this.handleAutoAuth(message);
+      this.handleAIChatHook(username, message);
+    });
+
+    this.bot.on('whisper', (username, message) => {
+      this.log('Chat', `[Whisper] <${username}> ${message}`);
+      sendDiscordWebhook(this.config.webhook_url, 'Whisper Received', `From ${username}: ${message}`, 0x9B59B6);
+      this.handleAIWhisperHook(username, message);
+    });
+
+    this.bot.on('health', () => {
+      if (this.bot.health <= 6) {
+        this.log('Bot Errors', `CRITICAL HEALTH WARNING: ${this.bot.health}/20`);
+        sendDiscordWebhook(this.config.webhook_url, 'Health Emergency', `Health dropped to ${this.bot.health}`, 0xE74C3C);
+      }
+    });
+
+    this.bot.on('kicked', (reason) => {
+      const parsed = typeof reason === 'string' ? reason : JSON.stringify(reason);
+      this.log('Bot Errors', `Kicked from server: ${parsed}`);
+      sendDiscordWebhook(this.config.webhook_url, 'Bot Kicked', `Reason: ${parsed}`, 0xE67E22);
+    });
+
+    this.bot.on('error', (err) => {
+      this.log('Bot Errors', `Mineflayer Error: ${err.message}`);
+    });
+
+    this.bot.on('end', (reason) => {
+      this.status = 'DISCONNECTED';
+      this.log('System', `Connection lost: ${reason}`);
+      this.cleanup();
+      this.scheduleReconnection();
+    });
+  }
+
+  // Jittered Exponential Backoff Reconnection Formula
+  scheduleReconnection() {
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectAttempts++;
+    const tInitial = 3000;
+    const tMax = 180000;
+    const jitter = Math.floor(Math.random() * 2000);
+    const delay = Math.min(tMax, tInitial * Math.pow(2, this.reconnectAttempts) + jitter);
+    
+    this.status = 'RECONNECTING';
+    this.log('System', `Backoff reconnection attempt #${this.reconnectAttempts} scheduled in ${Math.round(delay/1000)} seconds.`);
+    this.reconnectTimer = setTimeout(() => {
+      this.spawn();
+    }, delay);
+  }
+
+  // Humanized Anti-AFK Engine
+  startAntiAfkEngine() {
+    if (this.antiAfkInterval) clearInterval(this.antiAfkInterval);
+    this.antiAfkInterval = setInterval(() => {
+      if (!this.bot || this.status !== 'CONNECTED') return;
+      
+      const randomAction = Math.floor(Math.random() * 5);
+      const yaw = Math.random() * Math.PI * 2;
+      const pitch = (Math.random() - 0.5) * Math.PI * 0.5;
+
+      this.bot.look(yaw, pitch, true);
+
+      switch (randomAction) {
+        case 0:
+          this.bot.setControlState('sneak', true);
+          setTimeout(() => this.bot.setControlState('sneak', false), 800 + Math.random() * 1000);
+          break;
+        case 1:
+          this.bot.setControlState('jump', true);
+          setTimeout(() => this.bot.setControlState('jump', false), 250);
+          break;
+        case 2:
+          this.bot.setControlState('forward', true);
+          setTimeout(() => this.bot.setControlState('forward', false), 400);
+          break;
+        case 3:
+          const currentSlot = this.bot.quickBarSlot;
+          this.bot.setQuickBarSlot((currentSlot + 1) % 9);
+          break;
+        default:
+          break;
+      }
+    }, (120 + Math.floor(Math.random() * 180)) * 1000); // 2 to 5 minutes randomized
+  }
+
+  // Auto-Auth Regex Interceptor
+  handleAutoAuth(message) {
+    if (!this.config.auto_auth_pass) return;
+    const authRegex = /(?:\/register|\/login|Please log in|Type \/auth)/i;
+    if (authRegex.test(message)) {
+      const delay = 800 + Math.floor(Math.random() * 1400); // 800ms - 2200ms
+      setTimeout(() => {
+        if (message.includes('/register')) {
+          this.bot.chat(`/register ${this.config.auto_auth_pass} ${this.config.auto_auth_pass}`);
+        } else {
+          this.bot.chat(`/login ${this.config.auto_auth_pass}`);
+        }
+        this.log('System', 'Auto-Auth credential sequence executed.');
+      }, delay);
+    }
+  }
+
+  // In-Game AI Chat Hooks
+  async handleAIChatHook(username, message) {
+    if (message.startsWith('!ai ')) {
+      const prompt = message.replace('!ai ', '').trim();
+      const reply = await queryGroqAI(prompt, username);
+      this.bot.chat(reply);
+      this.log('AI', `Public AI trigger by ${username}: ${reply}`);
+    }
+  }
+
+  async handleAIWhisperHook(username, message) {
+    if (message.startsWith('!ai ') || message.length > 3) {
+      const reply = await queryGroqAI(message.replace('!ai ', ''), username);
+      this.bot.chat(`/w ${username} ${reply}`);
+      this.log('AI', `Whisper AI response sent to ${username}`);
+    }
+  }
+
+  // Spatial Radar & Inventory Telemetry Pump
+  startTelemetryPump() {
+    if (this.telemetryInterval) clearInterval(this.telemetryInterval);
+    this.telemetryInterval = setInterval(() => {
+      if (!this.bot || !this.bot.entity) return;
+
+      // Extract Nearby Entities within 32 blocks for 2D Radar
+      const entities = [];
+      for (const id in this.bot.entities) {
+        const entity = this.bot.entities[id];
+        if (entity === this.bot.entity) continue;
+        const dist = this.bot.entity.position.distanceTo(entity.position);
+        if (dist <= 32) {
+          entities.push({
+            id: entity.id,
+            name: entity.name || entity.username || entity.type,
+            type: entity.type,
+            x: Math.round(entity.position.x - this.bot.entity.position.x),
+            z: Math.round(entity.position.z - this.bot.entity.position.z)
+          });
+        }
+      }
+
+      // 9x4 Inventory Map
+      const inventory = this.bot.inventory.slots.slice(0, 36).map((item, idx) => ({
+        slot: idx,
+        name: item ? item.name : 'empty',
+        count: item ? item.count : 0
+      }));
+
+      const telemetry = {
+        botId: this.config.id,
+        health: this.bot.health || 0,
+        food: this.bot.food || 0,
+        ping: this.bot.player ? this.bot.player.ping : 0,
+        pos: {
+          x: Math.round(this.bot.entity.position.x),
+          y: Math.round(this.bot.entity.position.y),
+          z: Math.round(this.bot.entity.position.z)
+        },
+        dimension: this.bot.game ? this.bot.game.dimension : 'overworld',
+        entities,
+        inventory,
+        yaw: this.bot.entity.yaw
+      };
+
+      io.emit('bot_telemetry', telemetry);
+    }, 1000);
+  }
+
+  // Clean Destruction & Memory Safeguard Purge
+  cleanup() {
+    if (this.antiAfkInterval) clearInterval(this.antiAfkInterval);
+    if (this.telemetryInterval) clearInterval(this.telemetryInterval);
+    if (this.bot) {
+      this.bot.removeAllListeners();
+      if (this.bot.pathfinder) this.bot.pathfinder.setGoal(null);
+      try { this.bot.end(); } catch (e) {}
+      this.bot = null;
+    }
+  }
+
+  destroy() {
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.cleanup();
+    db.run('UPDATE bots SET is_active = 0 WHERE id = ?', [this.config.id]);
+    this.status = 'DISCONNECTED';
+    this.log('System', 'Bot instance completely terminated.');
+  }
+}
+
+// Global Memory Leak & V8 Heap Safeguard Monitor
+setInterval(() => {
+  const memoryUsage = process.memoryUsage();
+  const heapUsedMB = Math.round(memoryUsage.heapUsed / 1024 / 1024);
+  const heapTotalMB = Math.round(memoryUsage.heapTotal / 1024 / 1024);
+  const ratio = memoryUsage.heapUsed / memoryUsage.heapTotal;
+
+  if (ratio > 0.85) {
+    console.warn(`[V8 HEAP CRITICAL] High memory consumption detected: ${heapUsedMB}MB / ${heapTotalMB}MB (${Math.round(ratio*100)}%). Triggering Force GC...`);
+    if (global.gc) global.gc();
+  }
+}, 30000);
+
+// Macro Interpreter Engine
+async function executeMacroDSL(botInst, dslCode) {
+  const lines = dslCode.split('\n');
+  for (let line of lines) {
+    line = line.trim();
+    if (!line || line.startsWith('#')) continue;
+    const tokens = line.split(' ');
+    const cmd = tokens[0].toUpperCase();
+
+    if (!botInst || !botInst.bot) break;
+
+    switch (cmd) {
+      case 'DELAY':
+        await new Promise(r => setTimeout(r, parseInt(tokens[1]) || 1000));
+        break;
+      case 'SAY':
+        botInst.bot.chat(tokens.slice(1).join(' '));
+        break;
+      case 'COMMAND':
+        botInst.bot.chat('/' + tokens.slice(1).join(' '));
+        break;
+      case 'MOVE':
+        const dir = tokens[1];
+        const dur = parseInt(tokens[2]) || 1000;
+        botInst.bot.setControlState(dir, true);
+        await new Promise(r => setTimeout(r, dur));
+        botInst.bot.setControlState(dir, false);
+        break;
+      case 'LOOK':
+        botInst.bot.look(parseFloat(tokens[1]), parseFloat(tokens[2]), true);
+        break;
+      case 'EQUIP':
+        const slot = parseInt(tokens[1]);
+        botInst.bot.setQuickBarSlot(slot);
+        break;
+      case 'DROP_ALL':
+        for (const item of botInst.bot.inventory.items()) {
+          await botInst.bot.tossStack(item);
+        }
+        break;
+      default:
+        botInst.log('Macro Error', `Unknown DSL Directive: ${cmd}`);
+    }
+  }
+}
+
+// Dynamic Auto-Recovery: Respawn previously active bots on boot
+db.all('SELECT * FROM bots WHERE is_active = 1', [], (err, rows) => {
+  if (err || !rows) return;
+  console.log(`[AUTO-RECOVERY] Resuming ${rows.length} bots from persistent database state...`);
+  rows.forEach(botConfig => {
+    const inst = new ClusterBotInstance(botConfig);
+    clusterManager.set(botConfig.id, inst);
+    inst.spawn();
+  });
+});
+
+// Real-Time Socket.io Terminal & Control Handlers
 io.on('connection', (socket) => {
-    const emitLog = (type, msg) => socket.emit('log', { type, msg });
-    emitLog('sys', 'Connected to Engine Hub.');
+  socket.on('register_terminal_command', async (data) => {
+    const { botId, commandStr } = data;
+    const instance = clusterManager.get(botId);
+    if (!instance && !commandStr.startsWith('/add') && !commandStr.startsWith('/stopall')) {
+      return socket.emit('terminal_response', { status: 'error', message: 'Bot instance active reference not found.' });
+    }
 
-    // Status Loop
-    const syncInt = setInterval(() => socket.emit('bots_update', cluster.getClusterData()), 2000);
-    socket.on('disconnect', () => clearInterval(syncInt));
+    const parts = commandStr.trim().split(' ');
+    const cmd = parts[0].toLowerCase();
 
-    // Terminal Commands Parser
-    socket.on('command', (cmdString) => {
-        const args = cmdString.split(' ');
-        const cmd = args[0];
-        
-        if (cmd === '/add' && args.length >= 3) {
-            const config = { name: args[1], host: args[2], port: args[3]||25565, version: args[4], auth_mode: args[5]||'offline', proxy: args[6] };
-            db.run("INSERT INTO bots (name, host, port, version, auth_mode, proxy) VALUES (?,?,?,?,?,?)", [config.name, config.host, config.port, config.version, config.auth_mode, config.proxy]);
-            cluster.spawn(config, emitLog);
+    switch (cmd) {
+      case '/say':
+        if (instance && instance.bot) {
+          instance.bot.chat(parts.slice(1).join(' '));
+          instance.log('Command Execution', `Chat sent: ${parts.slice(1).join(' ')}`);
         }
-        else if (cmd === '/remove' && args[1]) {
-            cluster.remove(args[1]);
-            db.run("UPDATE bots SET is_active=0 WHERE name=?", [args[1]]);
-            emitLog('sys', `Bot ${args[1]} removed.`);
+        break;
+      case '/goto':
+        if (instance && instance.bot) {
+          const x = parseFloat(parts[1]);
+          const y = parseFloat(parts[2]);
+          const z = parseFloat(parts[3]);
+          const defaultMovements = new Movements(instance.bot);
+          instance.bot.pathfinder.setMovements(defaultMovements);
+          instance.bot.pathfinder.setGoal(new goals.GoalBlock(x, y, z));
+          instance.log('Command Execution', `Pathfinding initiated to (${x}, ${y}, ${z})`);
         }
-        else if (cmd === '/say' && args.length >= 3) {
-            const b = cluster.bots.get(args[1]);
-            if(b) b.instance.chat(args.slice(2).join(' '));
+        break;
+      case '/stopall':
+        clusterManager.forEach(inst => inst.destroy());
+        clusterManager.clear();
+        io.emit('terminal_response', { status: 'success', message: 'All cluster bots forcibly terminated.' });
+        break;
+      case '/script':
+        if (parts[1] === 'run' && parts[2]) {
+          db.get('SELECT * FROM macros WHERE id = ?', [parts[2]], (e, row) => {
+            if (row && instance) executeMacroDSL(instance, row.dsl_code);
+          });
         }
-        else if (cmd === '/goto' && args.length >= 5) {
-            const b = cluster.bots.get(args[1]);
-            if(b) b.instance.pathfinder.setGoal(new goals.GoalNear(parseFloat(args[2]), parseFloat(args[3]), parseFloat(args[4]), 1));
-        }
-        else if (cmd === '/script' && args[1] === 'run' && args.length >= 3) {
-            const sampleScript = `DELAY 1000\nSAY Hello from Macro!\nLOOK 3.14 0\nMOVE forward 1000`;
-            cluster.runMacro(args[2], sampleScript, emitLog);
-        }
-        else { emitLog('err', 'Unknown command or missing args.'); }
-    });
+        break;
+      default:
+        if (instance && instance.bot) instance.bot.chat(commandStr);
+        break;
+    }
+  });
 
-    socket.on('request_inventory', (botName) => {
-        const b = cluster.bots.get(botName);
-        if(b && b.instance.inventory) {
-            const items = b.instance.inventory.items().map(i => ({ name: i.name, count: i.count, slot: i.slot }));
-            socket.emit('inventory_data', { bot: botName, items });
-        }
-    });
-
-    // Finny UI AI Handler
-    socket.on('ai_request', async (msg) => {
-        if (!groq) return socket.emit('ai_response', 'No GROQ_API_KEY detected. AI is disabled.');
-        try {
-            const chatCompletion = await groq.chat.completions.create({
-                messages: [
-                    { role: 'system', content: 'You are Finny, the system administrator assistant for this Minecraft Bot cluster. Respond concisely.' },
-                    { role: 'user', content: msg }
-                ],
-                model: 'llama-3.3-70b-versatile',
-            });
-            socket.emit('ai_response', chatCompletion.choices[0]?.message?.content);
-        } catch(e) { 
-            socket.emit('ai_response', "Backend AI API Error."); 
-        }
-    });
+  socket.on('query_groq_assistant', async (data) => {
+    const { prompt } = data;
+    const reply = await queryGroqAI(prompt, 'DashboardUser');
+    socket.emit('groq_assistant_reply', { reply });
+  });
 });
 
-// ==========================================
-// 8. AUTO-RECOVERY & GRACEFUL SHUTDOWN
-// ==========================================
+// API Routes for Bots & Cluster Management
+app.get('/api/bots', requireAuth, (req, res) => {
+  const query = req.session.user.role === 'admin' ? 'SELECT * FROM bots' : 'SELECT * FROM bots WHERE owner_id = ?';
+  const params = req.session.user.role === 'admin' ? [] : [req.session.user.id];
+  db.all(query, params, (err, rows) => {
+    if (err) return res.status(500).json({ error: err.message });
+    res.json(rows);
+  });
+});
+
+app.post('/api/bots/create', requireAuth, (req, res) => {
+  const { username, host, port, version, auth_mode, proxy, auto_auth_pass, webhook_url } = req.body;
+  db.run(
+    `INSERT INTO bots (owner_id, username, host, port, version, auth_mode, proxy, auto_auth_pass, webhook_url, is_active)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`,
+    [req.session.user.id, username, host, port || 25565, version || 'auto', auth_mode || 'offline', proxy || '', auto_auth_pass || '', webhook_url || ''],
+    function (err) {
+      if (err) return res.status(500).json({ error: err.message });
+      const botId = this.lastID;
+      db.get('SELECT * FROM bots WHERE id = ?', [botId], (e, row) => {
+        const inst = new ClusterBotInstance(row);
+        clusterManager.set(botId, inst);
+        inst.spawn();
+        res.json({ success: true, bot: row });
+      });
+    }
+  );
+});
+
+app.post('/api/bots/:id/action', requireAuth, (req, res) => {
+  const botId = parseInt(req.params.id);
+  const { action } = req.body;
+  const instance = clusterManager.get(botId);
+
+  if (action === 'start') {
+    if (instance) instance.spawn();
+    else {
+      db.get('SELECT * FROM bots WHERE id = ?', [botId], (err, row) => {
+        if (row) {
+          const inst = new ClusterBotInstance(row);
+          clusterManager.set(botId, inst);
+          inst.spawn();
+        }
+      });
+    }
+  } else if (action === 'stop' && instance) {
+    instance.destroy();
+  }
+  res.json({ success: true });
+});
+
+// Embedded Single-Page Web Dashboard Interface
+app.get('*', (req, res) => {
+  res.send(`<!DOCTYPE html>
+<html lang="en" data-theme="cyberpunk">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Minecraft AFK Engine & Management Dashboard</title>
+  <script src="/socket.io/socket.io.js"></script>
+  <style>
+    :root {
+      --bg-base: #0a0a0f; --panel-bg: rgba(18, 18, 26, 0.75); --border-color: rgba(255, 255, 255, 0.12);
+      --accent: #00f0ff; --accent-glow: rgba(0, 240, 255, 0.4); --text: #f0f0f5; --danger: #ff0055;
+    }
+    [data-theme="synthwave"] { --bg-base: #1a0b2e; --accent: #ff71ce; --accent-glow: rgba(255, 113, 206, 0.4); }
+    [data-theme="dracula"] { --bg-base: #282a36; --accent: #bd93f9; --panel-bg: rgba(40, 42, 54, 0.8); }
+    [data-theme="nord"] { --bg-base: #2e3440; --accent: #88c0d0; --panel-bg: rgba(46, 52, 64, 0.8); }
+    [data-theme="matrix"] { --bg-base: #020d04; --accent: #00ff41; --panel-bg: rgba(5, 20, 8, 0.85); }
+    [data-theme="obsidian"] { --bg-base: #000000; --accent: #ffffff; --panel-bg: rgba(20, 20, 20, 0.9); }
+    [data-theme="oled"] { --bg-base: #000000; --accent: #39ff14; --panel-bg: #050505; }
+    [data-theme="solarized"] { --bg-base: #002b36; --accent: #2aa198; --panel-bg: rgba(7, 54, 66, 0.85); }
+    [data-theme="deepocean"] { --bg-base: #0b192c; --accent: #1e90ff; --panel-bg: rgba(30, 60, 90, 0.6); }
+    [data-theme="sunset"] { --bg-base: #2d132c; --accent: #ff6464; --panel-bg: rgba(80, 30, 60, 0.7); }
+    [data-theme="tokyonight"] { --bg-base: #1a1b26; --accent: #7aa2f7; --panel-bg: rgba(26, 27, 38, 0.85); }
+    [data-theme="emerald"] { --bg-base: #062c19; --accent: #50fa7b; --panel-bg: rgba(10, 50, 30, 0.8); }
+    [data-theme="crimson"] { --bg-base: #1a0000; --accent: #ff0000; --panel-bg: rgba(40, 0, 0, 0.8); }
+    [data-theme="cybergold"] { --bg-base: #141000; --accent: #ffd700; --panel-bg: rgba(40, 32, 0, 0.8); }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Segoe UI', Roboto, sans-serif; }
+    body { background: var(--bg-base); color: var(--text); min-height: 100vh; overflow-x: hidden; }
+    .glass { background: var(--panel-bg); backdrop-filter: blur(20px); border: 1px solid var(--border-color); border-radius: 12px; }
+    
+    header { padding: 1rem 2rem; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border-color); }
+    header h1 { color: var(--accent); text-shadow: 0 0 10px var(--accent-glow); font-size: 1.4rem; }
+    
+    .container { display: grid; grid-template-columns: 320px 1fr; gap: 1.5rem; padding: 1.5rem; max-width: 1600px; margin: 0 auto; }
+    .sidebar { display: flex; flex-direction: column; gap: 1rem; }
+    .main-content { display: flex; flex-direction: column; gap: 1.5rem; }
+
+    .card { padding: 1.2rem; }
+    .card h3 { margin-bottom: 1rem; font-size: 1rem; color: var(--accent); }
+    input, select, button { width: 100%; padding: 0.75rem; border-radius: 6px; border: 1px solid var(--border-color); background: rgba(0,0,0,0.4); color: #fff; margin-bottom: 0.75rem; }
+    button { background: var(--accent); color: #000; font-weight: bold; cursor: pointer; border: none; transition: 0.2s ease; }
+    button:hover { opacity: 0.9; box-shadow: 0 0 12px var(--accent-glow); }
+
+    .bot-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 1rem; }
+    .bot-card { position: relative; overflow: hidden; display: flex; flex-direction: column; gap: 0.75rem; }
+    .bot-card-header { display: flex; align-items: center; gap: 1rem; }
+    .bot-avatar { width: 48px; height: 48px; border-radius: 8px; background: #000; }
+    .status-badge { position: absolute; top: 12px; right: 12px; padding: 4px 8px; border-radius: 20px; font-size: 0.7rem; font-weight: bold; }
+    .status-CONNECTED { background: #00ff6622; color: #00ff66; border: 1px solid #00ff66; }
+    .status-DISCONNECTED { background: #ff005522; color: #ff0055; border: 1px solid #ff0055; }
+    
+    .stat-bar { height: 8px; background: rgba(255,255,255,0.1); border-radius: 4px; overflow: hidden; margin-top: 4px; }
+    .stat-fill { height: 100%; transition: width 0.3s ease; }
+    
+    .radar-canvas { width: 100%; height: 260px; background: #000; border-radius: 8px; }
+    .inventory-grid { display: grid; grid-template-columns: repeat(9, 1fr); gap: 4px; }
+    .inventory-slot { aspect-ratio: 1; background: rgba(0,0,0,0.6); border: 1px solid var(--border-color); border-radius: 4px; display: flex; align-items: center; justify-content: center; font-size: 0.65rem; position: relative; }
+    .inventory-slot .count { position: absolute; bottom: 2px; right: 2px; font-weight: bold; }
+
+    .terminal { height: 300px; background: #000; border-radius: 8px; padding: 1rem; font-family: monospace; font-size: 0.85rem; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; }
+    .terminal-line { word-break: break-all; }
+    .category-System { color: #888; }
+    .category-Chat { color: #00f0ff; }
+    .category-AI { color: #bd93f9; }
+
+    /* Finny Floating Assistant */
+    .finny-widget { position: fixed; bottom: 24px; right: 24px; width: 320px; z-index: 999; display: flex; flex-direction: column; }
+    .finny-header { padding: 0.75rem; background: var(--accent); color: #000; font-weight: bold; border-radius: 12px 12px 0 0; cursor: pointer; display: flex; justify-content: space-between; }
+    .finny-body { height: 240px; padding: 0.75rem; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; font-size: 0.85rem; }
+  </style>
+</head>
+<body>
+  <header class="glass">
+    <h1>MINECRAFT AFK ENGINE ARCHITECT</h1>
+    <div style="width: 200px;">
+      <select id="themeSelect" onchange="switchTheme(this.value)">
+        <option value="cyberpunk">Cyberpunk Neon</option>
+        <option value="synthwave">Synthwave '84</option>
+        <option value="dracula">Dracula</option>
+        <option value="nord">Nord Dark</option>
+        <option value="matrix">Matrix Terminal</option>
+        <option value="obsidian">Obsidian Minimal</option>
+        <option value="oled">OLED Pure Black</option>
+        <option value="solarized">Solarized Midnight</option>
+        <option value="deepocean">Deep Ocean</option>
+        <option value="sunset">Sunset Violet</option>
+        <option value="tokyonight">Tokyo Night</option>
+        <option value="emerald">Emerald Forest</option>
+        <option value="crimson">Crimson Blood</option>
+        <option value="cybergold">Cyber Gold</option>
+      </select>
+    </div>
+  </header>
+
+  <div class="container">
+    <div class="sidebar">
+      <div class="card glass">
+        <h3>Deploy Bot Instance</h3>
+        <input type="text" id="botUsername" placeholder="Bot Username">
+        <input type="text" id="botHost" placeholder="Target Server Host">
+        <input type="number" id="botPort" value="25565" placeholder="Port">
+        <select id="botAuth">
+          <option value="offline">Offline / Cracked</option>
+          <option value="microsoft">Microsoft OAuth</option>
+        </select>
+        <input type="password" id="botAutoAuth" placeholder="Auto-Auth Password">
+        <input type="text" id="botWebhook" placeholder="Discord Webhook URL">
+        <button onclick="deployBot()">Deploy to Cluster</button>
+      </div>
+
+      <div class="card glass">
+        <h3>Spatial 2D Radar (32b Radius)</h3>
+        <canvas id="radarCanvas" class="radar-canvas" width="280" height="260"></canvas>
+      </div>
+    </div>
+
+    <div class="main-content">
+      <div id="botCardsGrid" class="bot-grid"></div>
+
+      <div class="card glass">
+        <h3>Live Interactive Inventory (Selected Bot)</h3>
+        <div id="inventoryContainer" class="inventory-grid"></div>
+      </div>
+
+      <div class="card glass">
+        <h3>Cluster Terminal & Command Interceptor</h3>
+        <div id="terminalLog" class="terminal"></div>
+        <div style="display: flex; gap: 0.5rem; margin-top: 0.75rem;">
+          <input type="text" id="terminalCmd" placeholder="Type slash command (e.g., /goto 100 64 -200, /say Hello, /stopall)" style="margin-bottom: 0;">
+          <button onclick="sendTerminalCommand()" style="width: 120px;">Send</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Finny Groq AI Widget -->
+  <div class="finny-widget glass">
+    <div class="finny-header" onclick="toggleFinny()">
+      <span>🤖 Finny AI Assistant</span>
+      <span id="finnyToggleText">▼</span>
+    </div>
+    <div id="finnyContent">
+      <div id="finnyBody" class="finny-body">
+        <div style="color: var(--accent);">Finny: Ready to assist with cluster operations.</div>
+      </div>
+      <div style="padding: 0.5rem;">
+        <input type="text" id="finnyInput" placeholder="Ask Finny AI..." onkeypress="if(event.key==='Enter')askFinny()" style="margin: 0;">
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const socket = io();
+    let selectedBotId = null;
+    let botTelemetryMap = new Map();
+
+    // Audio Synthesizer via Web Audio API
+    const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    function playAudioSound(type) {
+      if (audioCtx.state === 'suspended') audioCtx.resume();
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      osc.connect(gain);
+      gain.connect(audioCtx.destination);
+
+      if (type === 'connect') {
+        osc.frequency.setValueAtTime(440, audioCtx.currentTime);
+        osc.frequency.exponentialRampToValueAtTime(880, audioCtx.currentTime + 0.2);
+        gain.gain.setValueAtTime(0.1, audioCtx.currentTime);
+        osc.start(); osc.stop(audioCtx.currentTime + 0.2);
+      } else if (type === 'command') {
+        osc.type = 'square';
+        osc.frequency.setValueAtTime(600, audioCtx.currentTime);
+        gain.gain.setValueAtTime(0.05, audioCtx.currentTime);
+        osc.start(); osc.stop(audioCtx.currentTime + 0.05);
+      }
+    }
+
+    function switchTheme(theme) {
+      document.documentElement.setAttribute('data-theme', theme);
+    }
+
+    async function fetchBots() {
+      const res = await fetch('/api/bots');
+      if (res.ok) {
+        const bots = await res.json();
+        renderBotCards(bots);
+      }
+    }
+
+    function renderBotCards(bots) {
+      const grid = document.getElementById('botCardsGrid');
+      grid.innerHTML = '';
+      bots.forEach(bot => {
+        if (!selectedBotId) selectedBotId = bot.id;
+        const telemetry = botTelemetryMap.get(bot.id) || { health: 20, food: 20, ping: 0, pos: {x:0,y:0,z:0} };
+        const card = document.createElement('div');
+        card.className = 'card glass bot-card';
+        card.onclick = () => { selectedBotId = bot.id; renderInventory(); };
+        card.innerHTML = \`
+          <span class="status-badge status-\${bot.is_active ? 'CONNECTED' : 'DISCONNECTED'}">\${bot.is_active ? 'CONNECTED' : 'DISCONNECTED'}</span>
+          <div class="bot-card-header">
+            <img class="bot-avatar" src="https://crafatar.com/renders/head/\${bot.username}?scale=3&default=MHO" alt="Avatar">
+            <div>
+              <h4 style="color:#fff;">\${bot.username}</h4>
+              <p style="font-size:0.75rem; color:#888;">\${bot.host}:\${bot.port}</p>
+            </div>
+          </div>
+          <div>
+            <div style="font-size:0.75rem; display:flex; justify-content:space-between;"><span>Health</span><span>\${telemetry.health}/20</span></div>
+            <div class="stat-bar"><div class="stat-fill" style="width:\${(telemetry.health/20)*100}%; background:#ff0055;"></div></div>
+            <div style="font-size:0.75rem; display:flex; justify-content:space-between; margin-top:4px;"><span>Hunger</span><span>\${telemetry.food}/20</span></div>
+            <div class="stat-bar"><div class="stat-fill" style="width:\${(telemetry.food/20)*100}%; background:#ffaa00;"></div></div>
+          </div>
+          <div style="font-size:0.75rem; color:#aaa; display:flex; justify-content:space-between; margin-top:4px;">
+            <span>XYZ: \${telemetry.pos.x}, \${telemetry.pos.y}, \${telemetry.pos.z}</span>
+            <span>\${telemetry.ping}ms</span>
+          </div>
+          <div style="display:flex; gap:0.5rem; margin-top:0.5rem;">
+            <button onclick="event.stopPropagation(); triggerAction(\${bot.id}, 'start')">Start</button>
+            <button onclick="event.stopPropagation(); triggerAction(\${bot.id}, 'stop')" style="background:var(--danger); color:#fff;">Stop</button>
+          </div>
+        \`;
+        grid.appendChild(card);
+      });
+    }
+
+    async function deployBot() {
+      const username = document.getElementById('botUsername').value;
+      const host = document.getElementById('botHost').value;
+      const port = document.getElementById('botPort').value;
+      const auth_mode = document.getElementById('botAuth').value;
+      const auto_auth_pass = document.getElementById('botAutoAuth').value;
+      const webhook_url = document.getElementById('botWebhook').value;
+
+      if (!username || !host) return alert('Username and Host are required!');
+
+      const res = await fetch('/api/bots/create', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ username, host, port, auth_mode, auto_auth_pass, webhook_url })
+      });
+      if (res.ok) {
+        playAudioSound('connect');
+        fetchBots();
+      }
+    }
+
+    async function triggerAction(botId, action) {
+      await fetch(\`/api/bots/\${botId}/action\`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ action })
+      });
+      playAudioSound('command');
+      fetchBots();
+    }
+
+    // Socket Telemetry Receiver
+    socket.on('bot_telemetry', (data) => {
+      botTelemetryMap.set(data.botId, data);
+      if (data.botId === selectedBotId) {
+        renderRadar(data.entities, data.yaw);
+        renderInventory(data.inventory);
+      }
+    });
+
+    socket.on('bot_log', (data) => {
+      const logBox = document.getElementById('terminalLog');
+      const line = document.createElement('div');
+      line.className = \`terminal-line category-\${data.log.category}\`;
+      line.innerText = \`[\${data.log.timestamp}] [\${data.log.category}] \${data.log.message}\`;
+      logBox.appendChild(line);
+      logBox.scrollTop = logBox.scrollHeight;
+    });
+
+    // 2D Canvas Radar Rendering
+    function renderRadar(entities = [], yaw = 0) {
+      const canvas = document.getElementById('radarCanvas');
+      const ctx = canvas.getContext('2d');
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      const cx = canvas.width / 2;
+      const cy = canvas.height / 2;
+      const scale = canvas.width / 64; // 32 block radius
+
+      // Grid Rings
+      ctx.strokeStyle = '#222';
+      ctx.beginPath(); ctx.arc(cx, cy, scale * 10, 0, Math.PI * 2); ctx.stroke();
+      ctx.beginPath(); ctx.arc(cx, cy, scale * 20, 0, Math.PI * 2); ctx.stroke();
+      ctx.beginPath(); ctx.arc(cx, cy, scale * 30, 0, Math.PI * 2); ctx.stroke();
+
+      // Render Central Arrow (Bot)
+      ctx.save();
+      ctx.translate(cx, cy);
+      ctx.rotate(yaw || 0);
+      ctx.fillStyle = '#00f0ff';
+      ctx.beginPath(); ctx.moveTo(0, -8); ctx.lineTo(6, 6); ctx.lineTo(-6, 6); ctx.closePath(); ctx.fill();
+      ctx.restore();
+
+      // Entities
+      entities.forEach(ent => {
+        const ex = cx + (ent.x * scale);
+        const ey = cy + (ent.z * scale);
+        ctx.fillStyle = ent.type === 'player' ? '#00f0ff' : ent.type === 'mob' ? '#ff0055' : '#00ff66';
+        ctx.beginPath(); ctx.arc(ex, ey, 4, 0, Math.PI * 2); ctx.fill();
+      });
+    }
+
+    function renderInventory(slots = []) {
+      const container = document.getElementById('inventoryContainer');
+      container.innerHTML = '';
+      for (let i = 0; i < 36; i++) {
+        const item = slots.find(s => s.slot === i) || { name: 'empty', count: 0 };
+        const slotEl = document.createElement('div');
+        slotEl.className = 'inventory-slot';
+        slotEl.innerText = item.name !== 'empty' ? item.name.substring(0, 4) : '';
+        if (item.count > 1) {
+          const cnt = document.createElement('span');
+          cnt.className = 'count';
+          cnt.innerText = item.count;
+          slotEl.appendChild(cnt);
+        }
+        container.appendChild(slotEl);
+      }
+    }
+
+    function sendTerminalCommand() {
+      const cmdInput = document.getElementById('terminalCmd');
+      const commandStr = cmdInput.value;
+      if (!commandStr || !selectedBotId) return;
+      socket.emit('register_terminal_command', { botId: selectedBotId, commandStr });
+      cmdInput.value = '';
+      playAudioSound('command');
+    }
+
+    // Finny Assistant Interactive Logic
+    function toggleFinny() {
+      const content = document.getElementById('finnyContent');
+      const text = document.getElementById('finnyToggleText');
+      if (content.style.display === 'none') {
+        content.style.display = 'block'; text.innerText = '▼';
+      } else {
+        content.style.display = 'none'; text.innerText = '▲';
+      }
+    }
+
+    function askFinny() {
+      const input = document.getElementById('finnyInput');
+      const prompt = input.value;
+      if (!prompt) return;
+
+      const body = document.getElementById('finnyBody');
+      body.innerHTML += \`<div style="color:#fff;">You: \${prompt}</div>\`;
+      socket.emit('query_groq_assistant', { prompt });
+      input.value = '';
+      body.scrollTop = body.scrollHeight;
+    }
+
+    socket.on('groq_assistant_reply', (data) => {
+      const body = document.getElementById('finnyBody');
+      body.innerHTML += \`<div style="color:var(--accent);">Finny: \${data.reply}</div>\`;
+      body.scrollTop = body.scrollHeight;
+    });
+
+    // Boot Init
+    fetchBots();
+  </script>
+</body>
+</html>`);
+});
+
+// OS Signal Trap & Graceful Cluster Shutdown
+function gracefulShutdown(signal) {
+  console.log(`[OS SIGNAL ${signal}] Initiating clean cluster shutdown...`);
+  
+  clusterManager.forEach((instance) => {
+    instance.destroy();
+  });
+
+  db.close((err) => {
+    if (err) console.error('[DB CLOSE ERROR]', err.message);
+    else console.log('[DB] Persistent SQLite connection closed.');
+    
+    server.close(() => {
+      console.log('[HTTP] Socket & Express Server closed cleanly.');
+      process.exit(0);
+    });
+  });
+
+  setTimeout(() => {
+    console.warn('[FORCED EXIT] Emergency termination timeout reached.');
+    process.exit(1);
+  }, 5000);
+}
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
+// Server Launch
 server.listen(PORT, () => {
-    console.log(`[SYSTEM] Engine online on port ${PORT}`);
-    // Auto-Recovery from DB
-    setTimeout(() => {
-        db.all("SELECT * FROM bots WHERE is_active=1", (err, rows) => {
-            if(rows) rows.forEach(r => cluster.spawn({ name: r.name, host: r.host, port: r.port, version: r.version, auth_mode: r.auth_mode, proxy: r.proxy }, (type, msg) => console.log(`[RECOVERY] ${msg}`)));
-        });
-    }, 2000);
+  console.log(`=======================================================`);
+  console.log(`MINECRAFT AFK CLUSTER ENGINE ACTIVE ON PORT ${PORT}`);
+  console.log(`Dashboard UI: http://localhost:${PORT}`);
+  console.log(`Environment: ${process.env.NODE_ENV || 'production'}`);
+  console.log(`=======================================================`);
 });
-
-// OS Signal Traps
-const shutdown = () => {
-    console.log('\n[SYSTEM] SIGTERM received. Executing graceful shutdown...');
-    Array.from(cluster.bots.values()).forEach(b => {
-        b.instance.quit('Dyno Restarting - BRB');
-    });
-    db.close();
-    server.close(() => process.exit(0));
-    setTimeout(() => process.exit(1), 5000);
-};
-process.on('SIGINT', shutdown);
-process.on('SIGTERM', shutdown);
-
 EOF
 
-# Expose port and run the monolithic Node script
+# Production Runtime Container Config
+ENV NODE_ENV=production
+ENV PORT=3000
+
 EXPOSE 3000
-CMD ["node", "/app/bot.js"]
+
+# Execute Process Launch
+CMD ["node", "bot.js"]
