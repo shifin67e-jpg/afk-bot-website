@@ -18,19 +18,36 @@ const path = require('path');
 // ==========================================
 // 1. RUNTIME AUTO-BOOTSTRAPPER
 // ==========================================
-if (!fs.existsSync('./package.json')) {
-    console.log("[SYSTEM] Initializing package.json...");
-    fs.writeFileSync('./package.json', JSON.stringify({
-        name: "enterprise-afk-bot-engine",
-        version: "1.0.0",
-        main: "bot.js",
-        type: "commonjs"
-    }));
+// Safely check if core modules exist. If they don't, trigger install.
+const checkDependencies = () => {
+    try {
+        require.resolve('dotenv');
+        require.resolve('groq-sdk');
+        require.resolve('mineflayer');
+        return true;
+    } catch (e) {
+        return false;
+    }
+};
+
+if (!checkDependencies()) {
+    console.log("[SYSTEM] Missing dependencies detected. Initializing installation...");
+    if (!fs.existsSync('./package.json')) {
+        fs.writeFileSync('./package.json', JSON.stringify({
+            name: "enterprise-afk-bot-engine",
+            version: "1.0.0",
+            main: "bot.js",
+            type: "commonjs"
+        }));
+    }
+    
+    // Fixed: Using groq-sdk instead of @groq/groq-sdk
     const deps = "express@^4.19.0 socket.io@^4.7.0 dotenv@^16.4.0 helmet@^7.1.0 cors@^2.8.5 " +
         "mineflayer@^4.20.0 mineflayer-pathfinder@^2.4.0 mineflayer-auto-eat@^1.4.0 " +
         "mineflayer-armor-manager@^2.0.1 mineflayer-collectblock@^1.6.0 mineflayer-pvp@^1.3.0 vec3@^0.1.10 " +
-        "@groq/groq-sdk@^0.5.0 bcryptjs@^2.4.3 express-session@^1.18.0 connect-sqlite3@^0.9.15 " +
+        "groq-sdk@^0.5.0 bcryptjs@^2.4.3 express-session@^1.18.0 connect-sqlite3@^0.9.15 " +
         "express-rate-limit@^7.2.0 sqlite3@^5.1.7 socks-proxy-agent@^8.0.3 axios@^1.6.8";
+        
     console.log("[SYSTEM] Installing Dependencies... This will take a moment.");
     execSync(`npm install ${deps}`, { stdio: 'inherit' });
 }
@@ -51,7 +68,7 @@ const rateLimit = require('express-rate-limit');
 const sqlite3 = require('sqlite3').verbose();
 const { SocksProxyAgent } = require('socks-proxy-agent');
 const axios = require('axios');
-const Groq = require('@groq/groq-sdk');
+const Groq = require('groq-sdk'); // Fixed import
 const mineflayer = require('mineflayer');
 const { pathfinder, Movements, goals } = require('mineflayer-pathfinder');
 const autoeat = require('mineflayer-auto-eat').plugin;
@@ -64,7 +81,14 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server, { pingInterval: 20000, pingTimeout: 45000 });
 const PORT = process.env.PORT || 3000;
-const groq = new Groq({ apiKey: process.env.GROQ_API_KEY || 'MISSING_KEY' });
+let groq;
+
+try {
+    // Safe initialization in case key is missing
+    groq = new Groq({ apiKey: process.env.GROQ_API_KEY || 'MISSING_KEY' });
+} catch (e) {
+    console.warn("[SYSTEM] Groq API SDK initialized without a valid key. AI features will be disabled.");
+}
 
 // ==========================================
 // 3. DATABASE (WAL MODE) & SCHEMAS
@@ -352,7 +376,7 @@ const FRONTEND_HTML = `
 // ==========================================
 // 5. EXPRESS & MIDDLEWARE
 // ==========================================
-app.use(helmet({ contentSecurityPolicy: false })); // Relaxed for local inline scripts & Crafatar imgs
+app.use(helmet({ contentSecurityPolicy: false })); 
 app.use(cors());
 app.use(express.json());
 app.use(session({
@@ -369,7 +393,6 @@ app.post('/api/login', authLimiter, (req, res) => {
         if (row && bcrypt.compareSync(req.body.p, row.password)) {
             req.session.userId = row.id;
             req.session.role = row.role;
-            // Generate simple static token for socket auth (In real prod, use JWT)
             const token = Buffer.from(`${row.id}:${row.role}:${Date.now()}`).toString('base64');
             res.json({ success: true, token });
         } else {
@@ -491,7 +514,7 @@ class BotCluster {
             }
             
             // In-Game NLP (Groq)
-            if(msg.includes('!ai ')) {
+            if(msg.includes('!ai ') && groq) {
                 const prompt = msg.split('!ai ')[1];
                 try {
                     const chatCompletion = await groq.chat.completions.create({
@@ -499,7 +522,9 @@ class BotCluster {
                         model: 'llama-3.3-70b-versatile',
                     });
                     bot.chat(chatCompletion.choices[0]?.message?.content || 'AI unavailable');
-                } catch(e) {}
+                } catch(e) {
+                    emitLog('err', `[${config.name}] Groq API Error: ${e.message}`);
+                }
             }
         });
 
@@ -613,7 +638,6 @@ io.on('connection', (socket) => {
             if(b) b.instance.pathfinder.setGoal(new goals.GoalNear(parseFloat(args[2]), parseFloat(args[3]), parseFloat(args[4]), 1));
         }
         else if (cmd === '/script' && args[1] === 'run' && args.length >= 3) {
-            // Demo script inline execution
             const sampleScript = `DELAY 1000\nSAY Hello from Macro!\nLOOK 3.14 0\nMOVE forward 1000`;
             cluster.runMacro(args[2], sampleScript, emitLog);
         }
@@ -630,6 +654,7 @@ io.on('connection', (socket) => {
 
     // Finny UI AI Handler
     socket.on('ai_request', async (msg) => {
+        if (!groq) return socket.emit('ai_response', 'No GROQ_API_KEY detected. AI is disabled.');
         try {
             const chatCompletion = await groq.chat.completions.create({
                 messages: [
@@ -639,7 +664,9 @@ io.on('connection', (socket) => {
                 model: 'llama-3.3-70b-versatile',
             });
             socket.emit('ai_response', chatCompletion.choices[0]?.message?.content);
-        } catch(e) { socket.emit('ai_response', "Backend AI API Error."); }
+        } catch(e) { 
+            socket.emit('ai_response', "Backend AI API Error."); 
+        }
     });
 });
 
